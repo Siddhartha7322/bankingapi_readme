@@ -1019,17 +1019,17 @@ SLF4J API  -->  Log4j Appenders (Console, Rolling File, Async)
 
 ---
 
-# 🧩 PHASE 7 (EXPANDED): Bean Validation + Custom Annotations
+## 🧩 PHASE 7 (EXPANDED): Bean Validation + Custom Annotations
 
 ---
 
-## 🔹 Objective (short)
+### 🔹 Objective (short)
 
 Define a complete **validation contract** for every incoming API payload and method parameter: field-level rules, POJO-level (cross-field) rules, validation groups for create/update flows, message interpolation & i18n rules, and the exact error shapes to return on failure. *No implementation instructions here — only rules, messages, alternatives, and acceptance criteria.*
 
 ---
 
-## 🔸 Problem statement (concise)
+### 🔸 Problem statement (concise)
 
 Requests are currently accepted with inconsistent checks. We must prevent invalid data reaching business logic by defining a single, authoritative validation specification for all DTOs and parameters. This specification must cover:
 
@@ -1042,11 +1042,11 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## ✅ Requirements — DTO by DTO (fields, required validation types, message keys)
+### ✅ Requirements — DTO by DTO (fields, required validation types, message keys)
 
 > For each field below I give: Field name → Requirement → **Type of validation** → Suggested message key (for interpolation/i18n).
 
-### Customer DTOs
+#### Customer DTOs
 
 * **CustomerCreateDTO**
 
@@ -1076,7 +1076,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-### Account DTOs
+#### Account DTOs
 
 * **AccountCreateDTO**
 
@@ -1106,7 +1106,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-### Transaction DTOs
+#### Transaction DTOs
 
 * **TransactionCreateDTO**
 
@@ -1140,7 +1140,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## 🔧 Types of validation (summary, no implementation)
+### 🔧 Types of validation (summary, no implementation)
 
 * **Standard field-level:** not-null, not-blank, size, pattern, enum membership, numeric min/max, decimal scale.
 * **Custom field-level:** account number format, idempotency key format.
@@ -1150,7 +1150,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## 🔁 Validation Groups (what to define) — which fields belong to which group
+### 🔁 Validation Groups (what to define) — which fields belong to which group
 
 **Groups (recommended names)** — these are *contracts*, not implementation:
 
@@ -1169,7 +1169,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## 🌐 Message interpolation & i18n — what to specify (OR'd options)
+### 🌐 Message interpolation & i18n — what to specify (OR'd options)
 
 **Goal:** every validation message must be localizable and able to interpolate constraint attributes (e.g., `{min}`, `{max}`, `{validatedValue}`).
 
@@ -1207,7 +1207,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## 📤 Expected HTTP status codes & message contract (validation errors)
+### 📤 Expected HTTP status codes & message contract (validation errors)
 
 **Primary behavior**
 
@@ -1246,7 +1246,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## ✅ Acceptance Criteria (testable)
+### ✅ Acceptance Criteria (testable)
 
 1. **Per-field** rules: for each DTO field listed above, sending invalid value yields HTTP 400 with entry in `details` matching the field and messageKey.
 2. **Class-level** checks: e.g., transfer from==to → HTTP 400 + `transfer.sameaccount`.
@@ -1264,7 +1264,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## ⚠ Disallowed / Pitfalls (explicit)
+### ⚠ Disallowed / Pitfalls (explicit)
 
 * **Heavy DB calls inside validators**: avoid validators that perform expensive queries per request (scan over indexes is ok; but heavy joins/aggregation is not).
 * **Echoing PII in `rejectedValue`** (SSN, full account numbers, card PANs) — mask or omit.
@@ -1277,7 +1277,7 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## 🧪 Functional Verification Checklist (concrete)
+### 🧪 Functional Verification Checklist (concrete)
 
 * Send invalid `CustomerCreateDTO` (missing name/email) → 400; `details` includes `customer.name.required`, `customer.email.invalid`.
 * Send `TransferRequestDTO` with same `from` & `to` → 400; `details` contains `transfer.sameaccount`.
@@ -1287,9 +1287,9 @@ Requests are currently accepted with inconsistent checks. We must prevent invali
 
 ---
 
-## 🖼 Diagrams
+### 🖼 Diagrams
 
-### 1) Entity/DTO relationship (ASCII)
+#### 1) Entity/DTO relationship (ASCII)
 
 ```
 [Customer Entity] ←─< 1..* ── [Account Entity] ──< 1..* ── [Transaction Entity]
@@ -1300,7 +1300,7 @@ CustomerUpdateDTO           AccountUpdateDTO         TransactionResponseDTO
 CustomerResponseDTO         AccountResponseDTO       TransferRequestDTO
 ```
 
-### 2) Validation flow (with OR'd places where validation may be triggered)
+#### 2) Validation flow (with OR'd places where validation may be triggered)
 
 ```
 [HTTP Request]
@@ -1323,7 +1323,7 @@ Service layer execution (only if validation passed)
 
 ---
 
-## 📚 References (expanded)
+### 📚 References
 
 * Bean Validation (JSR-380): [https://beanvalidation.org/2.0-jsr380/](https://beanvalidation.org/2.0-jsr380/)
 * Hibernate Validator (user guide, 6.x): [https://docs.jboss.org/hibernate/stable/validator/reference/en-US/html\_single/](https://docs.jboss.org/hibernate/stable/validator/reference/en-US/html_single/)
