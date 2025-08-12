@@ -1343,11 +1343,395 @@ Service layer execution (only if validation passed)
 
 ---
 
-# 🧩 PHASE 9: Transaction Management, Locking, and Atomicity — Specification
+## 🧩 PHASE 8: Global Exception Handling — Specification (detailed)
 
 ---
 
-## 🔹 Objective
+### 🔹 Objective
+
+Define a complete, centralized **exception-to-HTTP contract** for the BankEase API: which exceptions may be raised (by which layer/use-case), the exact HTTP status to return, the canonical JSON error payload shape (including i18n keys), logging level, and operational behaviors (headers, metrics, no stack traces in responses). **This phase is the specification only** — where and how to throw exceptions will be listed, but implementation (ControllerAdvice, mappers) is intentionally left for implementation phase.
+
+---
+
+### 🔸 Problem statement
+
+Without a single canonical exception handling contract:
+
+* Different controllers/services return inconsistent HTTP codes and message formats.
+* Clients cannot reliably interpret errors (no machine-friendly message keys).
+* Sensitive internals may leak in messages/stack traces.
+* Monitoring/alerts are noisy because log levels aren’t standardized.
+* Localisation and consistent error codes are missing.
+
+We must therefore define a single authoritative mapping from exceptions → HTTP response, and define exactly what the response JSON must contain (keys), how to log them, and where each exception originates.
+
+---
+
+### ✅ Core requirements (summary)
+
+* Single canonical error JSON shape (or RFC-7807 alternative) used across all endpoints.
+* Every error response MUST include: `timestamp`, `status`, `errorCode`, `messageKey`, `message` (localized), `path`, `correlationId`. Validation failures include `details` array with per-field entries.
+* No stack traces or internal exception class names exposed in responses.
+* Client (4xx) errors logged at `WARN`; server (5xx) errors logged at `ERROR`. Some conflict/concurrency may be `WARN` or `ERROR` (see mapping).
+* Map every expected exception from Phases 1–7 to a unique `errorCode` prefix and message key.
+* Provide a consistent policy for conflicts (409 vs 400) — present both options where teams must choose.
+* Return appropriate headers when applicable (e.g., `Retry-After`, `Location` for resource creation contradictions, `X-Error-Code` optional).
+* Include localization support: response includes both `messageKey` (machine) and `message` (localized). If no locale, default to `en`.
+
+---
+
+### 📤 Canonical error response contract (recommended)
+
+**Canonical JSON (recommended):**
+
+```json
+{
+  "timestamp": "2025-08-13T10:15:30Z",
+  "status": 404,
+  "error": "Not Found",
+  "errorCode": "BANK-CUST-404",
+  "messageKey": "customer.notfound",
+  "message": "Customer not found for ID 123",
+  "path": "/api/v1/customers/123",
+  "correlationId": "123e4567-e89b-12d3-a456-426614174000",
+  "details": [
+    { "field": "email", "messageKey": "customer.email.invalid", "message": "must be a well-formed email address" }
+  ],
+  "locale": "en"
+}
+```
+
+**RFC-7807 alternative (allowed OR choice)**
+If you prefer `application/problem+json`:
+
+* Top-level: `type`, `title`, `status`, `detail`, `instance`.
+* Add extension fields: `errorCode`, `messageKey`, `correlationId`, `invalidParams` (array with fields).
+  (Teams MUST pick canonical or RFC-7807 and be consistent across all endpoints.)
+
+---
+
+### 🧭 Error code pattern & naming
+
+* Pattern: `BANK-<COMP>-<NNN>`
+
+  * `<COMP>` = short component or domain code (e.g., `CUST`, `ACCT`, `TXN`, `AUTH`, `DB`, `SRV`)
+  * `<NNN>` = 3-digit numeric (HTTP-ish or sequence)
+* Examples:
+
+  * `BANK-CUST-404` → Customer not found
+  * `BANK-ACCT-409` → Account conflict (duplicate account number)
+  * `BANK-TXN-INSF` → Insufficient funds (use letters for domain-specific codes optionally)
+  * `BANK-SRV-500` → Generic internal server error
+
+**Requirement:** `errorCode` is machine-friendly and unique for each distinct failure mode.
+
+---
+
+### 🗺 Exception taxonomy and exact mapping
+
+Below is the exhaustive mapping the system should follow. For each entry: **Exception name → thrown-from (where) → HTTP status → errorCode → messageKey → message (example) → log level**. Use these as the authoritative spec when implementing `throw` sites and global handlers.
+
+> NOTE: Where multiple reasonable statuses exist, alternatives are shown as `OR` choices; pick one policy consistently.
+
+---
+
+#### 1) **Validation failures (structure/field/class-level)**
+
+* **Exception(s):** `MethodArgumentNotValidException` (binding), `ConstraintViolationException` (param/method), `ValidationException` (custom)
+* **Thrown from:** Controller argument binding, validation layer (pre-service)
+* **HTTP status:** `400 Bad Request`
+* **errorCode:** `BANK-VAL-400` (general) or granular `BANK-<ENTITY>-VAL-400`
+* **messageKey:** `validation.failed` (top-level) & per-detail keys e.g., `customer.email.invalid`
+* **message:** `"Validation failed"` (top) + localized details
+* **details:** array of `{ field, messageKey, message[, rejectedValue?] }`
+* **log level:** `WARN`
+* **Notes:** `rejectedValue` must never include sensitive data (mask or omit).
+
+**Example (body-level):** see canonical above.
+**Where to throw/trigger:** automatic binding or explicit validation in service/controller for method params — ensure thrown before any business transaction.
+
+---
+
+#### 2) **Resource Not Found**
+
+* **Exception(s):** `CustomerNotFoundException`, `AccountNotFoundException`, `TransactionNotFoundException` (custom)
+* **Thrown from:** Service layer when DB lookup returns empty
+* **HTTP status:** `404 Not Found`
+* **errorCode:** `BANK-CUST-404`, `BANK-ACCT-404`, `BANK-TXN-404`
+* **messageKey:** `customer.notfound`, `account.notfound`, `transaction.notfound`
+* **message:** `"Customer not found for ID {id}"`
+* **log level:** `WARN` (expected client error)
+* **Where to throw:** e.g., `CustomerService.findById(id)` → if not found throw `CustomerNotFoundException`.
+
+---
+
+#### 3) **Authentication / Authorization**
+
+* **Authentication failures**
+
+  * **Exception:** `AuthenticationException` / `BadCredentialsException`
+  * **Thrown from:** Auth filter / security module
+  * **HTTP status:** `401 Unauthorized`
+  * **errorCode:** `BANK-AUTH-401`
+  * **messageKey:** `auth.unauthorized`
+  * **message:** `"Authentication required or invalid credentials"`
+  * **log level:** `WARN`
+* **Authorization / Access denied**
+
+  * **Exception:** `AccessDeniedException` / `ForbiddenOperationException`
+  * **Thrown from:** Security layer, service checks
+  * **HTTP status:** `403 Forbidden`
+  * **errorCode:** `BANK-AUTH-403`
+  * **messageKey:** `auth.forbidden`
+  * **message:** `"You do not have permission to perform this operation"`
+  * **log level:** `WARN`
+
+---
+
+#### 4) **Conflict / Duplicate Resource**
+
+* **Exception(s):** `DuplicateResourceException` (custom) OR infrastructure `DataIntegrityViolationException` (DB)
+* **Thrown from:** Service (pre-check) or repository (unique constraint violation)
+* **HTTP status (choose one policy):** `409 Conflict` **(recommended)** OR `400 Bad Request` (alternate)
+* **errorCode:** `BANK-<ENTITY>-409` (e.g., `BANK-CUST-409`)
+* **messageKey:** `customer.email.duplicate`, `account.number.duplicate`
+* **message:** `"Customer with email {email} already exists"`
+* **log level:** `WARN` (or `ERROR` if unexpected DB integrity issue)
+* **Where to throw:** e.g., `CustomerService.create()` if duplicate found throw `DuplicateResourceException`; DB unique index violation yields `DataIntegrityViolationException` mapped to same response.
+
+---
+
+#### 5) **Business rule violations**
+
+* **Examples:** `InsufficientFundsException`, `AccountClosedException`, `InvalidAccountStatusException`
+* **Thrown from:** Service layer (TransactionService, AccountService)
+* **HTTP status (OR):** `400 Bad Request` **(commonly used)** OR `422 Unprocessable Entity` (semantic alternative)
+* **errorCode:** e.g., `BANK-TXN-INSF` for insufficient funds
+* **messageKey:** `transaction.insufficientFunds`
+* **message:** `"Insufficient funds in account {accountNumber}"`
+* **log level:** `WARN`
+* **Where to throw (exact examples):**
+
+  * `TransactionService.debit(accountId, amount)` → if `balance < amount` throw `InsufficientFundsException`.
+  * `AccountService.delete(accountId)` → if `balance > 0` throw `InvalidAccountStateException` (map to 409 or 400 per policy).
+
+---
+
+#### 6) **Optimistic / Concurrency conflicts**
+
+* **Exception(s):** `OptimisticLockingFailureException` / `ObjectOptimisticLockingFailureException`
+* **Thrown from:** Repository / JPA when `@Version` conflict occurs
+* **HTTP status:** `409 Conflict`
+* **errorCode:** `BANK-DB-409` or `BANK-ACCT-409` (domain-specific)
+* **messageKey:** `concurrency.conflict`
+* **message:** `"Resource update conflict – please retry"`
+* **log level:** `WARN` (expected if contention occurs)
+* **Where to throw/propagate:** JPA layer; handler should return above mapping and optionally set `Retry-After` header if backoff recommended.
+
+---
+
+#### 7) **Transaction / Data integrity errors**
+
+* **Exception(s):** `TransactionSystemException`, `DataIntegrityViolationException` (unexpected)
+* **Thrown from:** DB / transaction manager
+* **HTTP status:** `500 Internal Server Error`
+* **errorCode:** `BANK-DB-500`
+* **messageKey:** `database.error`
+* **message:** `"Internal database error"`
+* **log level:** `ERROR` (include stack trace in logs only)
+* **Notes:** If caused by client-supplied invalid data that bypassed validation, consider `400`/`409` earlier.
+
+---
+
+#### 8) **External / Downstream service failures**
+
+* **Exception(s):** `DownstreamServiceException`, `ExternalServiceException`, `HttpClientErrorException`, etc.
+* **Thrown from:** Integration adapters calling external payment/KYC/notification services
+* **HTTP status (OR):**
+
+  * `502 Bad Gateway` → external service returned an error to us (recommended)
+  * `503 Service Unavailable` → external dependency is down or overloaded (alternate)
+* **errorCode:** `BANK-EXT-502` or `BANK-EXT-503`
+* **messageKey:** `external.service.failure`
+* **message:** `"Third-party service {name} returned an error"`
+* **log level:** `ERROR` (and emit metric + alert)
+
+---
+
+#### 9) **Timeouts**
+
+* **Exception(s):** `TimeoutException`, `SocketTimeoutException`
+* **Thrown from:** Network calls, DB query timeout, external API calls
+* **HTTP status:** `504 Gateway Timeout` (or `503` if local degraded)
+* **errorCode:** `BANK-EXT-504`
+* **messageKey:** `timeout`
+* **message:** `"Request to service {name} timed out"`
+* **log level:** `ERROR` + metric (increase timeout counter)
+
+---
+
+#### 10) **Service unavailable / critical infrastructure**
+
+* **Exception(s):** DB connection failure `DataAccessResourceFailureException`, severe resource exhaustion
+* **Thrown from:** DataSource, connection pool, infrastructure checks
+* **HTTP status:** `503 Service Unavailable`
+* **errorCode:** `BANK-SRV-503`
+* **messageKey:** `service.unavailable`
+* **message:** `"Service temporarily unavailable — try again later"`
+* **log level:** `ERROR` + alerting
+
+---
+
+#### 11) **Unknown / uncaught exceptions**
+
+* **Exception(s):** `Throwable` fallback
+* **Thrown from:** anything not explicitly handled
+* **HTTP status:** `500 Internal Server Error`
+* **errorCode:** `BANK-SRV-500`
+* **messageKey:** `internal.error`
+* **message:** `"An unexpected error occurred. Reference: {errorCode}"`
+* **log level:** `ERROR` (log full stack trace)
+
+---
+
+### 🔁 Mapping summary table (quick view)
+
+(Abbreviated — use above section for full detail)
+
+| Exception Category                 | HTTP Status  | errorCode (example) | messageKey                    | Log Level |
+| ---------------------------------- | ------------ | ------------------- | ----------------------------- | --------- |
+| Validation (field/POJO)            | 400          | BANK-VAL-400        | validation.failed             | WARN      |
+| Not Found                          | 404          | BANK-CUST-404       | customer.notfound             | WARN      |
+| Unauthorized                       | 401          | BANK-AUTH-401       | auth.unauthorized             | WARN      |
+| Forbidden                          | 403          | BANK-AUTH-403       | auth.forbidden                | WARN      |
+| Duplicate/Conflict                 | 409 (or 400) | BANK-CUST-409       | customer.email.duplicate      | WARN      |
+| Business rule (insufficient funds) | 400 (or 422) | BANK-TXN-INSF       | transaction.insufficientFunds | WARN      |
+| Concurrency conflict               | 409          | BANK-DB-409         | concurrency.conflict          | WARN      |
+| DB/Transaction failure             | 500          | BANK-DB-500         | database.error                | ERROR     |
+| External service error             | 502 or 503   | BANK-EXT-502        | external.service.failure      | ERROR     |
+| Timeout                            | 504          | BANK-EXT-504        | timeout                       | ERROR     |
+| Service unavailable                | 503          | BANK-SRV-503        | service.unavailable           | ERROR     |
+| Unknown exception                  | 500          | BANK-SRV-500        | internal.error                | ERROR     |
+
+---
+
+### 🧾 Error response content details (required fields)
+
+Every error response MUST contain at a minimum:
+
+* `timestamp` → ISO-8601 UTC string (e.g., `Instant.now()`)
+* `status` → HTTP status code
+* `error` → HTTP reason phrase
+* `errorCode` → machine-friendly code (pattern above)
+* `messageKey` → i18n key for the error
+* `message` → localized human-friendly message
+* `path` → the request path (e.g., `/api/v1/accounts/123`)
+* `correlationId` → the request correlation id (MDC)
+* `details` → optional array for field-level problems (validation). Each detail: `{ field, messageKey, message, rejectedValue? }`
+* `locale` → optional locale the message was resolved in
+
+**Security note:** `rejectedValue` must be omitted or masked for sensitive fields (account numbers, PANs, passwords, SSNs). Use hashed or masked forms (e.g., `****3456`).
+
+---
+
+### 🎯 Logging & metrics policy (what to record)
+
+* **Logging**
+
+  * For every handled exception: log a single structured message containing `errorCode`, `messageKey`, `correlationId`, `path`, and stack trace for 5xx.
+  * log levels: 4xx → WARN; 5xx → ERROR.
+  * DO NOT include sensitive values in logs (mask before logging).
+* **Metrics**
+
+  * Increment counters per `errorCode` and HTTP status (e.g., `bank_errors_total{code="BANK-TXN-INSF"}`) for alerting and dashboards.
+  * Histograms/timers for exception latency if helpful.
+
+---
+
+### 🧪 Acceptance criteria (verifiable tests)
+
+1. **Mapping correctness:** For each exception in the taxonomy, an integration test triggers it and asserts the HTTP status, `errorCode`, `messageKey`, `message` exist and match the spec.
+2. **Validation responses:** Invalid DTOs return 400 with `details` listing fields and messageKeys.
+3. **No stack traces leak:** Responses do not contain stack traces or internal exception names.
+4. **Correlation id present:** Every error response includes `correlationId`; the same id is visible in logs.
+5. **Logging level checks:** 4xx entries logged at WARN, 5xx at ERROR (assert via log capture in tests).
+6. **Localisation:** If `Accept-Language` is set, `message` is returned in that language when translations available.
+7. **Conflict policy:** Duplicate-entity test yields either 409 or 400 according to chosen project policy (assert one).
+8. **Service unavailability:** Simulate DB down → endpoint returns 503 and `errorCode` `BANK-SRV-503`.
+
+---
+
+### ⚠ Pitfalls & design decisions (OR'd alternatives where applicable)
+
+* **409 vs 400 for duplicates:**
+
+  * Option A (recommended): Use `409 Conflict` for uniqueness constraints from DB or pre-checks.
+  * Option B: Use `400 Bad Request` for simplicity (less explicit).
+    → **Pick one** and document in API style guide.
+* **Business rule status:** Insufficient funds → `400` OR `422 Unprocessable Entity`.
+
+  * Many payment systems prefer `422` to distinguish semantic rule violation. Use `400` if you want a single client-error bucket.
+* **Error format:** canonical JSON vs RFC-7807 `problem+json`.
+
+  * Option A: Canonical JSON with `errorCode` and `messageKey` (recommended for internal APIs).
+  * Option B: RFC-7807 for standards compliance; extend with `errorCode` and `messageKey`.
+* **Re-try guidance:** For `503` or `502`, include `Retry-After` header if applicable.
+* **Masking policy:** Decide which fields are sensitive for `rejectedValue` (accountNumber, PAN, SSN, tokens). Masking must be consistent.
+
+---
+
+### 🖼 Diagrams
+
+**Exception flow (ASCII):**
+
+```
+[Controller] --> calls Service
+      |
+      v
+  Service throws (e.g., InsufficientFundsException)
+      |
+      v
+  Exception propagates to ControllerAdvice (global handler)
+      |
+      v
+  ControllerAdvice:
+    - maps exception -> errorCode, messageKey, status
+    - localizes message
+    - logs (WARN/ERROR) with correlationId
+    - builds canonical JSON or RFC-7807 body
+    - returns HTTP response
+```
+
+**Validation flow:**
+
+```
+[HTTP Request] -> Binding/Validation Layer (pre-controller or controller args)
+   |
+   |- If invalid -> ValidationException -> ControllerAdvice maps to 400 with details
+   |
+   -> if valid -> Controller -> Service -> Repository
+```
+
+---
+
+### 📚 References
+
+* Spring: `@ControllerAdvice` / Exception handling — [https://docs.spring.io/spring-framework/docs/current/reference/html/web.html#mvc-ann-exceptionhandler](https://docs.spring.io/spring-framework/docs/current/reference/html/web.html#mvc-ann-exceptionhandler)
+* RFC 7807 Problem Details for HTTP APIs — [https://datatracker.ietf.org/doc/html/rfc7807](https://datatracker.ietf.org/doc/html/rfc7807)
+* OWASP — Error Handling Guidance — [https://cheatsheetseries.owasp.org/cheatsheets/Error\_Handling\_Cheat\_Sheet.html](https://cheatsheetseries.owasp.org/cheatsheets/Error_Handling_Cheat_Sheet.html)
+* Baeldung — Exception Handling in Spring — [https://www.baeldung.com/exception-handling-for-rest-with-spring](https://www.baeldung.com/exception-handling-for-rest-with-spring)
+
+---
+
+
+
+---
+
+## 🧩 PHASE 9: Transaction Management, Locking, and Atomicity — Specification
+
+---
+
+### 🔹 Objective
 
 Define precise **transaction boundaries**, **isolation levels**, **locking strategies**, **atomicity rules**, and **retry/rollback policies** for all database-related operations in the **BankEase API**.  
 Goal: guarantee **data consistency**, **correctness**, and **reliability** under concurrent workloads while maintaining optimal performance.
@@ -1356,7 +1740,7 @@ This phase is **specification-only** — implementation of `@Transactional`, loc
 
 ---
 
-## 🔸 Problem Statement
+### 🔸 Problem Statement
 
 Without strict transaction and locking specifications:
 
@@ -1369,9 +1753,9 @@ Without strict transaction and locking specifications:
 
 ---
 
-## ✅ Requirements
+### ✅ Requirements
 
-### 1️⃣ Transaction Boundaries
+#### 1️⃣ Transaction Boundaries
 
 - **Service layer** is the only place transactions are started.
 - **One HTTP request = one transaction scope** (commit or rollback).
@@ -1382,7 +1766,7 @@ Without strict transaction and locking specifications:
 
 ---
 
-### 2️⃣ Service-layer Transaction Policy (per operation mapping)
+#### 2️⃣ Service-layer Transaction Policy (per operation mapping)
 
 | Service Method                                   | Propagation   | Isolation Level                                              | readOnly | Timeout | Retryable? | Notes                                                                 |
 | ------------------------------------------------ | ------------- | ------------------------------------------------------------ | -------- | ------- | ---------- | --------------------------------------------------------------------- |
@@ -1404,7 +1788,7 @@ Without strict transaction and locking specifications:
 
 ---
 
-### 3️⃣ Isolation Level Rules
+#### 3️⃣ Isolation Level Rules
 
 | Operation Type                            | Isolation Level    | Reason                                          |
 | ----------------------------------------- | ------------------ | ----------------------------------------------- |
@@ -1418,7 +1802,7 @@ Without strict transaction and locking specifications:
 
 ---
 
-### 4️⃣ Locking Strategy
+#### 4️⃣ Locking Strategy
 
 - **Primary:** Optimistic locking (`@Version` column in entity) for most cases.
 - **Fallback:** Pessimistic locking (`SELECT ... FOR UPDATE`) for high-contention accounts.
@@ -1433,7 +1817,7 @@ Without strict transaction and locking specifications:
   - **Policy B:** For non-idempotent ops, no retry — return **409** to client.
   - **Policy C:** Use Spring Retry library OR manual retry loop.
 
-#### **Pessimistic Locking (targeted)**
+##### **Pessimistic Locking (targeted)**
 
 - Use `@Lock(LockModeType.PESSIMISTIC_WRITE)` or native `FOR UPDATE` queries.
 - Apply only to:
@@ -1444,7 +1828,7 @@ Without strict transaction and locking specifications:
 
 ---
 
-### 5️⃣ Lock Ordering Policy
+#### 5️⃣ Lock Ordering Policy
 
 - Always lock multiple accounts in **ascending account ID** order.
 - Apply same policy across microservices in Phase 14.
@@ -1465,7 +1849,7 @@ transfer(from=A, to=B):
 
 ---
 
-### 6️⃣ Atomicity Rules
+#### 6️⃣ Atomicity Rules
 
 - Multi-step operations succeed **entirely** or fail **entirely**.
 - If any step fails → rollback everything.
@@ -1473,7 +1857,7 @@ transfer(from=A, to=B):
 
 ---
 
-### 7️⃣ Rollback Policy
+#### 7️⃣ Rollback Policy
 
 Rollback **on**:
 
@@ -1487,7 +1871,7 @@ Do **not rollback on**:
 
 ---
 
-### 8️⃣ Propagation Rules
+#### 8️⃣ Propagation Rules
 
 | Scenario                                          | Propagation Type |
 | ------------------------------------------------- | ---------------- |
@@ -1498,7 +1882,7 @@ Do **not rollback on**:
 
 ---
 
-## 📤 Response Requirements
+### 📤 Response Requirements
 
 - Rollback due to business violation → **409 Conflict**
 - Rollback due to system error → **500 Internal Server Error**
@@ -1518,7 +1902,7 @@ Example error:
 
 ---
 
-## 🧪 Acceptance Criteria
+### 🧪 Acceptance Criteria
 
 1. Two concurrent withdrawals never cause negative balance.
 2. Fund transfer rolls back entirely if credit fails after debit.
@@ -1528,7 +1912,7 @@ Example error:
 
 ---
 
-## ⚠ Disallowed
+### ⚠ Disallowed
 
 - `READ_UNCOMMITTED` isolation.
 - Long-lived locks during external calls.
@@ -1538,7 +1922,7 @@ Example error:
 
 ---
 
-## 🔄 Alternatives (OR’d for choice later)
+### 🔄 Alternatives (OR’d for choice later)
 
 - Isolation: default to `READ_COMMITTED` **OR** increase to `REPEATABLE_READ`.
 - Locking: optimistic everywhere **OR** mix with pessimistic for hot accounts.
@@ -1546,7 +1930,7 @@ Example error:
 
 ---
 
-## 🖼 Diagrams
+### 🖼 Diagrams
 
 **Transaction Lifecycle**
 
@@ -1575,7 +1959,7 @@ Commit and release locks
 
 ---
 
-## 📚 References
+### 📚 References
 
 - [Spring Transaction Management](https://docs.spring.io/spring-framework/docs/current/reference/html/data-access.html#transaction)
 - [JPA Locking](https://jakarta.ee/specifications/persistence/3.0/jakarta-persistence-spec-3.0.html#locking)
@@ -1585,27 +1969,3 @@ Commit and release locks
 ---
 
 
-
-# 🧩 PHASE 5: Pagination, Filtering & Sorting
-
-(Finalized detailed content from our earlier discussion with 3 OR'd options)
-
-
-# 🧩 PHASE 6: Logging with SLF4J + Log4j
-
-(Finalized detailed content with profile-based config, log4j.xml usage, and disallowed items)
-
-
-# 🧩 PHASE 7: Bean Validation + Custom Annotations
-
-(Finalized detailed, thorough spec including validation rules, groups, i18n, pitfalls, and diagrams)
-
-
-# 🧩 PHASE 8: Global Exception Handling
-
-(Finalized detailed spec covering exception-to-HTTP mapping, standard error response JSON, and disallowed practices)
-
-
-# 🧩 PHASE 9: Transaction Management, Locking, and Atomicity
-
-(Finalized detailed Phase 9 text from our last response)
