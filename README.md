@@ -1,6 +1,6 @@
 ---
 
-## 🧩 PHASE 1: Vanilla Spring MVC Project Setup with Open Liberty and Java 8
+## 🧩 PHASE 1: Vanilla Spring MVC Project Setup with Open Liberty and Java 11
 
 ---
 
@@ -1968,4 +1968,211 @@ Commit and release locks
 
 ---
 
+
+
+
+---
+
+## 🧩 PHASE 10A: Authentication & Authorization (Vanilla Spring) — Basic Auth, API Keys, JWT, RBAC
+
+---
+
+### 🔹 Objective
+
+Introduce **secure authentication** and **role-based access control** to the BankEase API using **Vanilla Spring Security** (no Spring Boot yet).
+Focus on core concepts every senior Java developer should know:
+
+* **Basic Authentication**
+* **API Key Authentication**
+* **JWT-based Authentication** (stateless sessions)
+* **Role-Based Access Control (RBAC)** at both endpoint and method level
+* **Security configuration best practices** for REST APIs
+* **Common pitfalls to avoid** when implementing security
+
+All authentication flows are implemented **locally**, without OAuth2 or centralized identity providers (those come in Phase 10B after Boot + microservices).
+
+---
+
+### 🔸 Problem Statement
+
+Right now, the API is **completely open** — anyone can access **any endpoint** without authentication or authorization.
+This leads to:
+
+* **Data exposure** — private customer/account details accessible to all.
+* **Unauthorized modifications** — malicious actors could modify or delete accounts.
+* **No audit trail** — impossible to know who made a change.
+
+**Security is non-negotiable** for a banking API — every request must be authenticated, and authorization rules must prevent privilege escalation.
+
+---
+
+### ✅ Requirements
+
+#### 1️⃣ Authentication Mechanisms to Implement
+
+We will implement **three mechanisms** in OR’d form so we can compare and test them:
+
+1. **Basic Auth** (username/password sent with every request — for internal dev/testing only)
+2. **API Key Auth** (a static token passed in a header or query param — for internal service-to-service calls)
+3. **JWT Auth** (JSON Web Tokens signed with HMAC — stateless, most secure for this phase)
+
+---
+
+#### 2️⃣ User & Role Model
+
+* **User entity**: id, username, password (BCrypt hashed), roles, createdAt, updatedAt
+* **Role entity**: id, name (`ROLE_ADMIN`, `ROLE_USER`, `ROLE_AUDITOR`)
+* A user can have **multiple roles** (Many-to-Many relationship)
+* Store in MySQL, load via Spring Security `UserDetailsService`
+
+---
+
+#### 3️⃣ Role-Based Access Control (RBAC)
+
+* **Role mapping examples**:
+
+  * `ROLE_ADMIN`: Full access to all endpoints (including DELETE)
+  * `ROLE_USER`: CRUD only on own accounts/transactions
+  * `ROLE_AUDITOR`: Read-only access to reports, customer list
+* Enforce RBAC using:
+
+  * **Endpoint-level rules** via `HttpSecurity.authorizeRequests()`
+  * **Method-level rules** via `@PreAuthorize` and SpEL expressions (`#id == authentication.principal.id`)
+
+---
+
+#### 4️⃣ Security Configuration
+
+* **Password Storage**: Always hashed with `BCryptPasswordEncoder`
+* **Stateless Sessions** for JWT — no HTTP session state stored server-side
+* **CSRF disabled** for stateless REST APIs
+* **Security Filter Chain** ordering:
+
+  1. API Key Filter (check `X-API-KEY` header first)
+  2. JWT Authentication Filter
+  3. Basic Auth fallback (only in non-prod profile)
+* **CORS** rules:
+
+  * Allow specific origins for web clients
+  * Deny all others
+
+---
+
+#### 5️⃣ Token Policy (for JWT)
+
+* **Claims to include**:
+
+  * `sub`: username
+  * `roles`: list of granted roles
+  * `iat`: issued timestamp
+  * `exp`: expiration (e.g., 15 minutes)
+* **Signing algorithm**: HMAC-SHA256 with a strong secret key (min 256 bits)
+* **Refresh tokens**:
+
+  * Optional for now — can issue a long-lived refresh token for learning
+  * Stored server-side in an in-memory map or DB table
+
+---
+
+### 📤 Response Requirements
+
+When authentication/authorization fails, follow **Phase 8** error format:
+
+**Example: Missing or invalid token**
+
+```json
+{
+  "timestamp": "2025-08-13T12:15:30Z",
+  "status": 401,
+  "error": "Unauthorized",
+  "message": "JWT token is expired or invalid",
+  "path": "/api/v1/accounts/1"
+}
+```
+
+**Example: Access denied**
+
+```json
+{
+  "timestamp": "2025-08-13T12:15:30Z",
+  "status": 403,
+  "error": "Forbidden",
+  "message": "You do not have permission to access this resource",
+  "path": "/api/v1/accounts"
+}
+```
+
+---
+
+### 🧪 Acceptance Criteria
+
+1. **Basic Auth**
+
+   * Sending correct credentials → access granted
+   * Sending wrong credentials → `401 Unauthorized`
+   * Passwords never logged in plain text
+
+2. **API Key**
+
+   * Correct `X-API-KEY` → request proceeds
+   * Missing/invalid → `401 Unauthorized`
+   * Keys stored securely (not hardcoded in code)
+
+3. **JWT**
+
+   * Valid token → access granted
+   * Expired token → `401 Unauthorized`
+   * Token signed with correct secret
+   * Role claim enforced in RBAC rules
+
+4. **RBAC**
+
+   * `ROLE_USER` cannot delete accounts
+   * `ROLE_AUDITOR` can only view, not modify
+   * `ROLE_ADMIN` can perform all actions
+
+---
+
+### ⚠ Disallowed
+
+* Storing passwords in plain text
+* Using same API key for all services in prod
+* Using weak JWT secret keys (short or guessable)
+* Relying solely on Basic Auth in production
+* Enabling CORS for all origins (`*`) in prod
+* Storing JWT tokens in local/session storage without secure flag (browser clients)
+
+---
+
+### 🔄 Alternatives (OR’d for choice later)
+
+* JWT signing: HMAC (simpler) **OR** RSA public/private keys (more secure, used in microservices phase)
+* API Key location: `X-API-KEY` header **OR** `apikey` query param (header recommended)
+* Role checks: `@PreAuthorize` annotations **OR** centralized config in `WebSecurityConfigurerAdapter`
+
+---
+
+### 🖼 Diagram — Authentication Flow (JWT Example)
+
+```
+[Client] -- POST /auth/login (username/password) -->
+[Auth Controller] -- validates credentials -->
+[JWT Generator] -- creates signed token -->
+[Client stores token] -- uses in Authorization header -->
+[JWT Filter] -- validates token & extracts roles -->
+[Controller] -- checks @PreAuthorize or role rules -->
+[Service/DB]
+```
+
+---
+
+### 📚 References
+
+* [Spring Security Reference — Core Concepts](https://docs.spring.io/spring-security/reference/)
+* [Spring Security — Method Security](https://docs.spring.io/spring-security/reference/servlet/authorization/method-security.html)
+* [JWT.io — JSON Web Tokens](https://jwt.io/introduction/)
+* [OWASP API Security Top 10](https://owasp.org/API-Security/)
+* [BCrypt Password Hashing](https://docs.spring.io/spring-security/reference/features/authentication/password-storage.html)
+
+---
 
